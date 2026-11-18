@@ -6,7 +6,7 @@
 Screen Pin 2.5
 
 功能：
-1. Alt + S 全局快捷键截图
+1. F8 全局快捷键截图
 2. 鼠标框选区域
 3. 多张截图独立悬浮
 4. Header 任意空白区域拖动图片
@@ -34,7 +34,6 @@ from tkinter import filedialog, messagebox
 
 import mss
 from PIL import Image, ImageTk, ImageDraw, ImageChops
-from pynput import keyboard
 
 
 # =========================================================
@@ -139,8 +138,6 @@ class ScreenPinApp:
         self.pins = []
         self.selecting = False
 
-        self.listener = None
-
         SAVE_DIR.mkdir(
             parents=True,
             exist_ok=True
@@ -154,31 +151,123 @@ class ScreenPinApp:
 
     def start_hotkey_listener(self):
 
-        def on_activate():
+        if os.name == "nt":
+            from ctypes import wintypes
 
-            self.root.after(
-                0,
-                self.start_selection
+            user32 = ctypes.windll.user32
+            comctl32 = ctypes.windll.comctl32
+            hwnd = self.root.winfo_id()
+            hotkey_id = 1
+            wm_hotkey = 0x0312
+            mod_norepeat = 0x4000
+            vk_f8 = 0x77
+
+            result_type = ctypes.c_ssize_t
+            subclass_proc = ctypes.WINFUNCTYPE(
+                result_type, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                wintypes.LPARAM, ctypes.c_size_t, ctypes.c_size_t
             )
-
-        def for_canonical(func):
-
-            return lambda key: func(
-                self.listener.canonical(key)
+            comctl32.SetWindowSubclass.argtypes = (
+                wintypes.HWND, subclass_proc, ctypes.c_size_t, ctypes.c_size_t
             )
+            comctl32.RemoveWindowSubclass.argtypes = (
+                wintypes.HWND, subclass_proc, ctypes.c_size_t
+            )
+            comctl32.DefSubclassProc.argtypes = (
+                wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+            )
+            comctl32.DefSubclassProc.restype = result_type
+            user32.RegisterHotKey.argtypes = (
+                wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT
+            )
+            user32.UnregisterHotKey.argtypes = (wintypes.HWND, ctypes.c_int)
 
-        hotkey = keyboard.HotKey(
-            keyboard.HotKey.parse("<alt>+s"),
-            on_activate
-        )
+            @subclass_proc
+            def on_window_message(window, message, wparam, lparam, subclass_id, data):
+                if message == wm_hotkey and wparam == hotkey_id:
+                    self.root.after_idle(self.start_selection)
+                    return 0
+                return comctl32.DefSubclassProc(window, message, wparam, lparam)
 
-        self.listener = keyboard.Listener(
-            on_press=for_canonical(hotkey.press),
-            on_release=for_canonical(hotkey.release)
-        )
+            if not comctl32.SetWindowSubclass(hwnd, on_window_message, hotkey_id, 0):
+                raise RuntimeError("无法初始化 F8 截图快捷键。")
 
-        self.listener.daemon = True
-        self.listener.start()
+            def stop():
+                user32.UnregisterHotKey(hwnd, hotkey_id)
+                comctl32.RemoveWindowSubclass(hwnd, on_window_message, hotkey_id)
+
+            if not user32.RegisterHotKey(hwnd, hotkey_id, mod_norepeat, vk_f8):
+                stop()
+                raise RuntimeError("无法注册 F8 截图快捷键，可能已被其他程序占用。")
+
+            self.stop_hotkey_listener = stop
+            return
+
+        from Xlib import X, XK, display, error
+
+        connection = display.Display()
+        desktop = connection.screen().root
+        keycode = connection.keysym_to_keycode(XK.XK_F8)
+        lock_keys = {
+            XK.string_to_keysym(name)
+            for name in ("Caps_Lock", "Num_Lock", "Scroll_Lock")
+        }
+        modifiers = {0}
+        for index, keycodes in enumerate(connection.get_modifier_mapping()):
+            if any(connection.keycode_to_keysym(code, 0) in lock_keys for code in keycodes if code):
+                modifiers |= {mask | (1 << index) for mask in modifiers}
+
+        grab_error = error.CatchError(error.BadAccess)
+        for mask in modifiers:
+            desktop.grab_key(keycode, mask, False, X.GrabModeAsync, X.GrabModeAsync,
+                             onerror=grab_error)
+        connection.sync()
+        if grab_error.get_error():
+            connection.close()
+            raise RuntimeError("无法注册 F8 截图快捷键，可能已被其他程序占用。")
+
+        # An application can already own an active keyboard grab (for example
+        # while displaying a menu). XRecord still observes F8 in that case.
+        from pynput import keyboard
+
+        modifier_keys = {
+            keyboard.Key.alt, keyboard.Key.alt_gr, keyboard.Key.ctrl,
+            keyboard.Key.shift, keyboard.Key.cmd,
+        }
+        held_modifiers = set()
+        f8_pressed = False
+
+        def on_press(key):
+            nonlocal f8_pressed
+            canonical = listener.canonical(key)
+            if canonical in modifier_keys:
+                held_modifiers.add(key)
+            elif key == keyboard.Key.f8 and not f8_pressed:
+                f8_pressed = True
+                if not held_modifiers:
+                    self.root.after(0, self.start_selection)
+
+        def on_release(key):
+            nonlocal f8_pressed
+            held_modifiers.discard(key)
+            if key == keyboard.Key.f8:
+                f8_pressed = False
+
+        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        listener.start()
+
+        def drain_grab_events(file, mask):
+            while connection.pending_events():
+                connection.next_event()
+
+        self.root.createfilehandler(connection.fileno(), tk.READABLE, drain_grab_events)
+
+        def stop():
+            listener.stop()
+            self.root.deletefilehandler(connection.fileno())
+            connection.close()
+
+        self.stop_hotkey_listener = stop
 
     # =====================================================
     # 区域截图
@@ -189,28 +278,27 @@ class ScreenPinApp:
         if self.selecting:
             return
 
+        try:
+            with mss.mss() as sct:
+                monitor = sct.monitors[0]
+                screenshot = sct.grab(monitor)
+                self.selection_image = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
+        except Exception as e:
+            messagebox.showerror("截图失败", str(e))
+            return
+
         self.selecting = True
-
-        with mss.mss() as sct:
-
-            monitor = sct.monitors[0]
-
-            left = monitor["left"]
-            top = monitor["top"]
-
-            width = monitor["width"]
-            height = monitor["height"]
+        self.selection_origin = monitor["left"], monitor["top"]
+        width, height = self.selection_image.size
 
         self.selector = tk.Toplevel(self.root)
-
         self.selector.overrideredirect(True)
 
-        self.selector.geometry(
-            f"{width}x{height}+{left}+{top}"
-        )
+        # A leading "+" makes negative offsets absolute virtual-desktop coordinates.
+        left, top = self.selection_origin
+        self.selector.geometry(f"{width}x{height}+{left}+{top}")
 
         self.selector.attributes("-topmost", True)
-        self.selector.attributes("-alpha", 0.28)
 
         self.selector.configure(bg="black")
 
@@ -223,11 +311,14 @@ class ScreenPinApp:
 
         self.canvas.pack(fill="both", expand=True)
 
+        self.selection_preview = ImageTk.PhotoImage(self.selection_image)
+        self.canvas.create_image(0, 0, anchor="nw", image=self.selection_preview)
+
         self.canvas.create_text(
             25,
             25,
             anchor="nw",
-            text="Alt + S 截图 | 鼠标左键框选 | ESC 取消",
+            text="F8 截图 | 鼠标左键框选 | ESC 取消",
             fill="white",
             font=("Microsoft YaHei", 13)
         )
@@ -288,32 +379,22 @@ class ScreenPinApp:
 
     def on_mouse_up(self, event):
 
-        x1 = min(self.start_x, event.x_root)
-        y1 = min(self.start_y, event.y_root)
+        left, top = self.selection_origin
+        image = self.selection_image
+        x1 = max(0, min(self.start_x, event.x_root) - left)
+        y1 = max(0, min(self.start_y, event.y_root) - top)
+        x2 = min(image.width, max(self.start_x, event.x_root) - left)
+        y2 = min(image.height, max(self.start_y, event.y_root) - top)
 
-        x2 = max(self.start_x, event.x_root)
-        y2 = max(self.start_y, event.y_root)
+        self.cancel_selection()
 
-        width = x2 - x1
-        height = y2 - y1
-
-        self.selector.destroy()
-
-        self.selecting = False
-        self.selection_rect = None
-
-        if width < 5 or height < 5:
+        if x2 - x1 < 5 or y2 - y1 < 5:
             return
 
-        self.root.after(
-            180,
-            lambda: self.capture_region(
-                x1,
-                y1,
-                width,
-                height
-            )
-        )
+        try:
+            self.create_pin(image.crop((x1, y1, x2, y2)), left + x1, top + y1)
+        except Exception as e:
+            messagebox.showerror("截图失败", str(e))
 
     def cancel_selection(self, event=None):
 
@@ -323,6 +404,8 @@ class ScreenPinApp:
 
             self.selecting = False
             self.selection_rect = None
+            self.selection_preview = None
+            self.selection_image = None
 
     # =====================================================
     # 自动保存路径
@@ -335,82 +418,6 @@ class ScreenPinApp:
         )
 
         return SAVE_DIR / f"ScreenPin_{timestamp}.png"
-
-    # =====================================================
-    # 截图
-    # =====================================================
-
-    def capture_region(self, x, y, width, height):
-
-        visible_pins = []
-
-        try:
-
-            for pin in list(self.pins):
-
-                try:
-
-                    if pin.window.winfo_exists():
-
-                        visible = (
-                            pin.window.state() != "withdrawn"
-                        )
-
-                        visible_pins.append(
-                            (pin, visible)
-                        )
-
-                        pin.window.withdraw()
-
-                except Exception:
-                    pass
-
-            self.root.update_idletasks()
-            self.root.update()
-
-            with mss.mss() as sct:
-
-                monitor = {
-                    "left": int(x),
-                    "top": int(y),
-                    "width": int(width),
-                    "height": int(height)
-                }
-
-                screenshot = sct.grab(monitor)
-
-                image = Image.frombytes(
-                    "RGB",
-                    screenshot.size,
-                    screenshot.rgb
-                )
-
-            for pin, visible in visible_pins:
-
-                if visible:
-
-                    try:
-                        pin.window.deiconify()
-                    except Exception:
-                        pass
-
-            self.create_pin(image, x, y)
-
-        except Exception as e:
-
-            for pin, visible in visible_pins:
-
-                if visible:
-
-                    try:
-                        pin.window.deiconify()
-                    except Exception:
-                        pass
-
-            messagebox.showerror(
-                "截图失败",
-                str(e)
-            )
 
     # =====================================================
     # 创建贴图
@@ -432,7 +439,10 @@ class ScreenPinApp:
 
     def run(self):
 
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self.stop_hotkey_listener()
 
 
 # =========================================================
@@ -1507,7 +1517,7 @@ if __name__ == "__main__":
     print("Screen Pin 2.5")
     print("=" * 55)
 
-    print("快捷键：Alt + S")
+    print("快捷键：F8")
 
     print(f"自动保存目录：{SAVE_DIR}")
 
@@ -1529,9 +1539,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
-
-    finally:
-
-        if app.listener:
-
-            app.listener.stop()
