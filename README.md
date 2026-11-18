@@ -21,6 +21,17 @@ py -m venv .venv
 .\.venv\Scripts\python.exe screen_pin.py
 ```
 
+**Windows 单文件打包（PyInstaller）**
+
+在 Windows 上完成上述虚拟环境和依赖安装后，在项目根目录打开 PowerShell 并运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install PyInstaller
+.\.venv\Scripts\python.exe -m PyInstaller --onefile --windowed --name ScreenPin --collect-submodules mss screen_pin.py
+```
+
+生成的可执行文件位于 `dist\ScreenPin.exe`。双击启动后，按 **F8** 即可截图。
+
 **Linux（X11）**
 
 以下系统包安装命令适用于 Debian 和 Ubuntu。请在 X11 桌面会话中运行。
