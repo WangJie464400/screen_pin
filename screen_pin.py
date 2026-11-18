@@ -154,51 +154,56 @@ class ScreenPinApp:
         if os.name == "nt":
             from ctypes import wintypes
 
+            from threading import Event, Thread
+
             user32 = ctypes.windll.user32
-            comctl32 = ctypes.windll.comctl32
-            hwnd = self.root.winfo_id()
             hotkey_id = 1
             wm_hotkey = 0x0312
             mod_norepeat = 0x4000
             vk_f8 = 0x77
+            ready = Event()
+            registered = Event()
+            requested = Event()
+            stopping = Event()
 
-            result_type = ctypes.c_ssize_t
-            subclass_proc = ctypes.WINFUNCTYPE(
-                result_type, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
-                wintypes.LPARAM, ctypes.c_size_t, ctypes.c_size_t
-            )
-            comctl32.SetWindowSubclass.argtypes = (
-                wintypes.HWND, subclass_proc, ctypes.c_size_t, ctypes.c_size_t
-            )
-            comctl32.RemoveWindowSubclass.argtypes = (
-                wintypes.HWND, subclass_proc, ctypes.c_size_t
-            )
-            comctl32.DefSubclassProc.argtypes = (
-                wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
-            )
-            comctl32.DefSubclassProc.restype = result_type
-            user32.RegisterHotKey.argtypes = (
-                wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT
-            )
-            user32.UnregisterHotKey.argtypes = (wintypes.HWND, ctypes.c_int)
+            def listen():
+                # Register against this thread's message queue, outside Tk's message pump.
+                try:
+                    if user32.RegisterHotKey(None, hotkey_id, mod_norepeat, vk_f8):
+                        registered.set()
+                finally:
+                    ready.set()
+                if not registered.is_set():
+                    return
 
-            @subclass_proc
-            def on_window_message(window, message, wparam, lparam, subclass_id, data):
-                if message == wm_hotkey and wparam == hotkey_id:
-                    self.root.after_idle(self.start_selection)
-                    return 0
-                return comctl32.DefSubclassProc(window, message, wparam, lparam)
+                try:
+                    # Reserve space for MSG.lPrivate on Python versions that omit it.
+                    message = ctypes.create_string_buffer(ctypes.sizeof(wintypes.MSG) + 4)
+                    while not stopping.is_set():
+                        if user32.PeekMessageW(message, None, wm_hotkey, wm_hotkey, 1):
+                            requested.set()
+                        else:
+                            stopping.wait(0.01)
+                finally:
+                    user32.UnregisterHotKey(None, hotkey_id)
 
-            if not comctl32.SetWindowSubclass(hwnd, on_window_message, hotkey_id, 0):
-                raise RuntimeError("无法初始化 F8 截图快捷键。")
+            worker = Thread(target=listen, name="F8 hotkey", daemon=True)
+            worker.start()
+            ready.wait()
+            if not registered.is_set():
+                raise RuntimeError("无法注册 F8 截图快捷键，可能已被其他程序占用。")
+
+            def poll():
+                self.root.after(10, poll)
+                if requested.is_set():
+                    requested.clear()
+                    self.start_selection()
+
+            self.root.after(10, poll)
 
             def stop():
-                user32.UnregisterHotKey(hwnd, hotkey_id)
-                comctl32.RemoveWindowSubclass(hwnd, on_window_message, hotkey_id)
-
-            if not user32.RegisterHotKey(hwnd, hotkey_id, mod_norepeat, vk_f8):
-                stop()
-                raise RuntimeError("无法注册 F8 截图快捷键，可能已被其他程序占用。")
+                stopping.set()
+                worker.join()
 
             self.stop_hotkey_listener = stop
             return
